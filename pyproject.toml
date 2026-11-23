@@ -1,0 +1,11 @@
+[project]
+name = "weather-bot"
+version = "0.1.0"
+description = "Weather-only chat assistant built with Streamlit, LangChain, and Grok."
+requires-python = ">=3.12"
+dependencies = [
+    "langchain>=1.5.2",
+    "langchain-xai>=1.4.1",
+    "python-dotenv>=1.2.4",
+    "streamlit>=1.67.0",
+]
