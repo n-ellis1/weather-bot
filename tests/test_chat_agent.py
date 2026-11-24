@@ -174,7 +174,8 @@ def test_empty_final_reply_falls_back_to_tool_error():
 def test_unknown_tool_is_refused_without_running():
     model = FakeModel([_call("run_shell", {"cmd": "dir"}), AIMessage(content="I can only look up weather.")])
     with patch.object(weather_tools.requests, "get") as get:
-        result = run_turn(model, [], "List my files")
+        # A weather prompt, so the request passes screening and the model's bad tool call is exercised.
+        result = run_turn(model, [], "What's the weather in Amarillo?")
     get.assert_not_called()
     payload = json.loads(_tool_messages(model)[0].content)
     assert payload["ok"] is False and "Unknown tool" in payload["error"]

@@ -7,6 +7,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from chat_agent import build_model, run_turn
+from safeguards import screen_request
 
 load_dotenv(Path(__file__).with_name(".env"))
 
@@ -28,6 +29,9 @@ def get_model():
 
 
 def answer(prompt: str, history: list[dict[str, str]]) -> str:
+    # Decline or clarify non-weather requests locally, before building or calling the model.
+    if (local_reply := screen_request(prompt, history)) is not None:
+        return local_reply
     if not os.getenv("XAI_API_KEY", "").strip():
         return "Weather-Bot isn't configured yet: the Grok API key (`XAI_API_KEY`) is missing."
     try:
