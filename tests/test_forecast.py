@@ -66,7 +66,7 @@ def test_tool_schema_is_structured():
     schema = get_weather_forecast.args
     assert set(schema) == {"city", "units"}
     assert schema["units"]["enum"] == ["metric", "imperial"]
-    assert schema["units"]["default"] == "metric"
+    assert schema["units"]["default"] == "imperial"
     assert get_weather_forecast.name == "get_weather_forecast"
 
 
@@ -163,13 +163,49 @@ def test_missing_country_and_weather_entries():
     assert result["days"][0]["conditions"] == "unknown"
 
 
+# --- per-day precipitation chance, humidity, wind, icon ----------------------
+
+
+def test_daily_precip_chance_is_max_pop_and_humidity_wind_aggregate():
+    base = _ts(2026, 11, 24, 6)  # 00:00 local
+    step = 3 * 3600
+    samples = []
+    for i, (pop, humidity, wind, icon, desc) in enumerate(
+        [(0.0, 40, 3.0, "01n", "clear sky"), (0.35, 50, 7.5, "10d", "light rain"),
+         (0.8, 60, 4.0, "10d", "light rain"), (0.2, 70, 5.5, "04d", "broken clouds")]
+    ):
+        s = _sample(base + i * step, 5.0 + i, desc)
+        s.update(pop=pop, wind={"speed": wind})
+        s["main"]["humidity"] = humidity
+        s["weather"][0]["icon"] = icon
+        samples.append(s)
+    day = _invoke_with(_payload(samples))[0]["days"][0]
+    assert day["precip_chance_percent"] == 80  # highest 3-hour probability, not an average
+    assert day["avg_humidity_percent"] == 55
+    assert day["max_wind_speed"] == 7.5
+    assert day["conditions"] == "light rain" and day["icon"] == "10d"
+
+
+def test_missing_pop_humidity_and_wind_are_none_not_zero():
+    day = _invoke_with(_payload([_sample(_ts(2026, 11, 24, 18), 3.0)]))[0]["days"][0]
+    assert day["precip_chance_percent"] is None
+    assert day["avg_humidity_percent"] is None
+    assert day["max_wind_speed"] is None
+    assert day["icon"] is None
+
+
+def test_note_explains_precip_aggregation():
+    result, _ = _invoke_with(_payload(_full_window(_ts(2026, 11, 24, 3))))
+    assert "highest probability of precipitation" in result["note"]
+
+
 # --- units ------------------------------------------------------------------
 
 
 def test_metric_request_and_labels():
     result, get = _invoke_with(_payload(_full_window(_ts(2026, 11, 24, 3))), units="metric")
     assert result["units"] == "metric"
-    assert result["unit_labels"] == {"temperature": "°C"}
+    assert result["unit_labels"] == {"temperature": "°C", "wind_speed": "m/s"}
     assert get.call_args.args[0] == weather_tools.FORECAST_URL
     assert get.call_args.kwargs["params"] == {"q": "Amarillo", "units": "metric", "appid": FAKE_KEY}
     assert get.call_args.kwargs["timeout"] == weather_tools.REQUEST_TIMEOUT_SECONDS
@@ -178,14 +214,14 @@ def test_metric_request_and_labels():
 def test_imperial_request_and_labels():
     result, get = _invoke_with(_payload(_full_window(_ts(2026, 11, 24, 3))), units="imperial")
     assert result["units"] == "imperial"
-    assert result["unit_labels"] == {"temperature": "°F"}
+    assert result["unit_labels"] == {"temperature": "°F", "wind_speed": "mph"}
     assert get.call_args.kwargs["params"]["units"] == "imperial"
 
 
-def test_default_units_is_metric():
+def test_default_units_is_imperial():
     result, get = _invoke_with(_payload(_full_window(_ts(2026, 11, 24, 3))))
-    assert result["units"] == "metric"
-    assert get.call_args.kwargs["params"]["units"] == "metric"
+    assert result["units"] == "imperial"
+    assert get.call_args.kwargs["params"]["units"] == "imperial"
 
 
 def test_success_result_does_not_contain_key():

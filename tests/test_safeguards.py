@@ -307,13 +307,18 @@ def test_answer_to_clarification_reaches_model_with_history():
     model = FakeModel(
         [_call("get_weather_forecast", {"city": "Paris"}), AIMessage(content="Tomorrow in Paris: light rain.")]
     )
-    with patch.object(weather_tools.requests, "get", return_value=_response(200, FORECAST_PAYLOAD)) as get:
+    # The provider must resolve the query to Paris: a result for another city fails the final check.
+    paris = FORECAST_PAYLOAD | {"city": FORECAST_PAYLOAD["city"] | {"name": "Paris", "country": "FR"}}
+    with patch.object(weather_tools.requests, "get", return_value=_response(200, paris)) as get:
         result = run(model, history, "Paris")
 
-    assert get.call_count == 1
+    assert get.call_count == 1  # the agent's own Paris lookup; the model's identical call reuses it
     assert result["reply"] == "Tomorrow in Paris: light rain."
     sent = model.calls[0][1]
-    assert [m.content for m in sent[1:]] == ["What about tomorrow?", CLARIFY_CITY_REPLY, "Paris"]
+    assert [m.content for m in sent[1:4]] == ["What about tomorrow?", CLARIFY_CITY_REPLY, "Paris"]
+    # The answer is looked up before the model runs, with the scope of the original question.
+    assert isinstance(sent[4], AIMessage) and sent[4].tool_calls[0]["name"] == "get_weather_forecast"
+    assert sent[4].tool_calls[0]["args"]["city"] == "Paris" and isinstance(sent[5], ToolMessage)
 
 
 def test_allowlist_and_limits_are_unchanged():
@@ -347,7 +352,7 @@ def test_app_answers_locally_without_building_or_calling_model(prompt, expected)
     assert FAKE_XAI_KEY not in shown and FAKE_OWM_KEY not in shown
 
 
-def _fake_run_turn(model, history, prompt):
+def _fake_run_turn(model, history, prompt, units="imperial"):
     return {"reply": f"reply to {prompt}", "tool_calls": [], "declined": False, "clarification": False}
 
 

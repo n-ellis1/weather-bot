@@ -57,8 +57,12 @@ def test_success_metric():
         "feels_like": 10.1,
         "humidity_percent": 40,
         "wind_speed": 6.2,
+        "pressure_hpa": None,
         "description": "clear sky",
-        "unit_labels": {"temperature": "°C", "wind_speed": "m/s"},
+        "icon": None,
+        "observed_local": None,
+        "utc_offset": None,
+        "unit_labels": {"temperature": "°C", "wind_speed": "m/s", "pressure": "hPa"},
     }
     kwargs = get.call_args.kwargs
     assert kwargs["params"] == {"q": "Amarillo", "units": "metric", "appid": FAKE_KEY}
@@ -68,12 +72,28 @@ def test_success_metric():
 def test_success_imperial_labels_and_default_units():
     with patch.object(weather_tools.requests, "get", return_value=_response(200, AMARILLO_PAYLOAD)):
         imperial = _invoke(units="imperial")
-    assert imperial["unit_labels"] == {"temperature": "°F", "wind_speed": "mph"}
+    assert imperial["unit_labels"] == {"temperature": "°F", "wind_speed": "mph", "pressure": "hPa"}
 
     with patch.object(weather_tools.requests, "get", return_value=_response(200, AMARILLO_PAYLOAD)) as get:
         default = _invoke()
-    assert default["units"] == "metric"
-    assert get.call_args.kwargs["params"]["units"] == "metric"
+    assert default["units"] == "imperial"
+    assert get.call_args.kwargs["params"]["units"] == "imperial"
+    assert get_current_weather.args["units"]["default"] == "imperial"
+
+
+def test_icon_pressure_and_local_observation_time_when_provided():
+    payload = AMARILLO_PAYLOAD | {
+        "dt": 1795546800,  # 2026-11-24 19:00 UTC
+        "timezone": -21600,  # UTC-06:00
+        "main": AMARILLO_PAYLOAD["main"] | {"pressure": 1018},
+        "weather": [{"description": "overcast clouds", "icon": "04d"}],
+    }
+    with patch.object(weather_tools.requests, "get", return_value=_response(200, payload)):
+        result = _invoke(units="imperial")
+    assert result["icon"] == "04d"
+    assert result["pressure_hpa"] == 1018
+    assert result["observed_local"] == "2026-11-24T13:00"
+    assert result["utc_offset"] == "-06:00"
 
 
 def test_invalid_units_rejected_by_schema():

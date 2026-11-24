@@ -96,10 +96,13 @@ def test_routes_current_weather_question_and_grounds_reply():
     assert result["reply"] == "It's 41 °F with light snow in Amarillo, US."
     assert [c["name"] for c in result["tool_calls"]] == ["get_current_weather"]
 
+    # The agent looks the named city up itself first; the model's identical call reuses that result
+    # (one HTTP request, one recorded call), and both tool messages carry the same data.
     tool_msgs = _tool_messages(model)
-    assert len(tool_msgs) == 1 and tool_msgs[0].tool_call_id == "call_1"
+    assert [m.tool_call_id for m in tool_msgs] == ["prefetch_1", "call_1"]
     payload = json.loads(tool_msgs[0].content)
     assert payload["ok"] is True and payload["temperature"] == 41.0 and payload["location"] == "Amarillo, US"
+    assert json.loads(tool_msgs[1].content) == payload
 
 
 def test_routes_forecast_question():
@@ -114,7 +117,9 @@ def test_routes_forecast_question():
 
     assert get.call_count == 1
     assert get.call_args.args[0] == weather_tools.FORECAST_URL
-    assert get.call_args.kwargs["params"]["units"] == "metric"
+    assert get.call_args.kwargs["params"]["units"] == "imperial"  # US units by default
+    assert result["units"] == "imperial"
+    assert result["tool_calls"][0]["args"] == {"city": "Amarillo", "units": "imperial"}
     assert [c["name"] for c in result["tool_calls"]] == ["get_weather_forecast"]
     payload = json.loads(_tool_messages(model)[0].content)
     assert payload["ok"] is True and payload["days"]
@@ -173,17 +178,23 @@ def test_empty_final_reply_falls_back_to_tool_error():
 
 def test_unknown_tool_is_refused_without_running():
     model = FakeModel([_call("run_shell", {"cmd": "dir"}), AIMessage(content="I can only look up weather.")])
-    with patch.object(weather_tools.requests, "get") as get:
+    with patch.object(weather_tools.requests, "get", return_value=_response(200, CURRENT_PAYLOAD)) as get:
         # A weather prompt, so the request passes screening and the model's bad tool call is exercised.
         result = run_turn(model, [], "What's the weather in Amarillo?")
-    get.assert_not_called()
-    payload = json.loads(_tool_messages(model)[0].content)
+    # Only the agent's own Amarillo lookup made an HTTP request; the unknown tool ran nothing.
+    assert get.call_count == 1 and get.call_args.args[0] == weather_tools.CURRENT_WEATHER_URL
+    unknown = [m for m in _tool_messages(model) if m.tool_call_id == "call_1"]
+    payload = json.loads(unknown[0].content)
     assert payload["ok"] is False and "Unknown tool" in payload["error"]
-    assert result["reply"] == "I can only look up weather."
+    assert [c["name"] for c in result["tool_calls"]] == ["get_current_weather", "run_shell"]
+    assert result["tool_calls"][1]["result"]["ok"] is False  # recorded as refused, never run
+    assert [c["name"] for c in result["shown_calls"]] == ["get_current_weather"]
+    assert result["verified"] is True
 
 
 def test_invalid_tool_args_return_error():
-    model = FakeModel([_call("get_current_weather", {"city": "Amarillo", "units": "kelvin"}), AIMessage(content="x")])
+    # Units are always set by the app, so an empty city is the remaining invalid argument.
+    model = FakeModel([_call("get_current_weather", {"city": ""}), AIMessage(content="x")])
     with patch.object(weather_tools.requests, "get") as get:
         run_turn(model, [], "Weather in kelvin?")
     get.assert_not_called()
@@ -212,7 +223,81 @@ def test_tool_call_cap_stops_the_loop():
     assert model.calls[-1][0].get("tool_choice") == "none"
     limited = [m for m in _tool_messages(model) if TOOL_LIMIT_MESSAGE in m.content]
     assert len(limited) == 9 - MAX_TOOL_CALLS_PER_TURN
-    assert result["reply"] == "Here's what I found."
+    # "Everywhere" isn't a place and the model's guessed cities aren't what was asked: ask for one.
+    assert result["reply"] == "Which city should I check the weather for?"
+
+
+# --- units -----------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("tool_name", ["get_current_weather", "get_weather_forecast"])
+@pytest.mark.parametrize(
+    ("setting", "model_units", "expected"),
+    [
+        ("imperial", None, "imperial"),
+        ("metric", None, "metric"),
+        ("metric", "imperial", "metric"),  # the session setting wins over the model's choice
+        ("imperial", "metric", "imperial"),
+    ],
+)
+def test_selected_units_are_passed_explicitly_to_both_tools(tool_name, setting, model_units, expected):
+    args = {"city": "Amarillo"} | ({"units": model_units} if model_units else {})
+    model = FakeModel([_call(tool_name, args), AIMessage(content="Done.")])
+
+    def by_url(url, params, timeout):
+        return _response(200, CURRENT_PAYLOAD if url == weather_tools.CURRENT_WEATHER_URL else FORECAST_PAYLOAD)
+
+    with patch.object(weather_tools.requests, "get", side_effect=by_url) as get:
+        result = run_turn(model, [], "What's the weather in Amarillo?", units=setting)
+
+    # Every request (the agent's own lookup and the model's) carries the selected units.
+    assert {c.kwargs["params"]["units"] for c in get.call_args_list} == {expected}
+    assert all(c["args"]["units"] == expected and c["result"]["units"] == expected for c in result["tool_calls"])
+    assert tool_name in [c["name"] for c in result["tool_calls"]]
+    assert result["units"] == expected
+    assert chat_agent.UNITS_NOTE[expected] in model.calls[0][1][0].content
+
+
+@pytest.mark.parametrize(
+    ("prompt", "setting", "expected"),
+    [
+        ("What's the weather in Paris in Celsius?", "imperial", "metric"),
+        ("Forecast for Paris in °C", "imperial", "metric"),
+        ("Paris forecast in ℃ please", "imperial", "metric"),
+        ("Wind in Oslo in m/s?", "imperial", "metric"),
+        ("Weather in Paris, metric please", "imperial", "metric"),
+        ("What's the weather in London in Fahrenheit?", "metric", "imperial"),
+        ("London wind in mph?", "metric", "imperial"),
+        ("Temperature in Tokyo in °F", "metric", "imperial"),
+        ("Weather in Paris in Fahrenheit and Celsius", "metric", "metric"),  # both named: keep the setting
+        ("Weather in Paris?", "metric", "metric"),
+        ("Weather in Paris?", "imperial", "imperial"),
+        ("Is it cold in Cincinnati?", "metric", "metric"),  # 'c' inside a word is not a unit request
+    ],
+)
+def test_explicit_unit_request_overrides_setting_for_that_reply(prompt, setting, expected):
+    model = FakeModel([_call("get_current_weather", {"city": "Paris"}), AIMessage(content="Done.")])
+    with patch.object(weather_tools.requests, "get", return_value=_response(200, CURRENT_PAYLOAD)) as get:
+        result = run_turn(model, [], prompt, units=setting)
+    assert get.call_args.kwargs["params"]["units"] == expected
+    assert result["units"] == expected
+
+
+def test_unit_request_applies_to_that_turn_only():
+    history = [
+        {"role": "user", "content": "Weather in Paris in Celsius?"},
+        {"role": "assistant", "content": "It's 5°C in Paris, FR.", "units": "metric"},
+    ]
+    model = FakeModel([_call("get_weather_forecast", {"city": "Paris"}), AIMessage(content="Done.")])
+    with patch.object(weather_tools.requests, "get", return_value=_response(200, FORECAST_PAYLOAD)) as get:
+        result = run_turn(model, history, "What about tomorrow?", units="imperial")
+    assert get.call_args.kwargs["params"]["units"] == "imperial"
+    assert result["units"] == "imperial"
+
+
+def test_invalid_units_setting_is_rejected():
+    with pytest.raises(ValueError):
+        run_turn(FakeModel([]), [], "Weather in Paris?", units="kelvin")
 
 
 def test_history_conversion_skips_unknown_roles():

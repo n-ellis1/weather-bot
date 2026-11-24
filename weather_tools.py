@@ -15,6 +15,7 @@ CURRENT_WEATHER_URL = "https://api.openweathermap.org/data/2.5/weather"
 FORECAST_URL = "https://api.openweathermap.org/data/2.5/forecast"
 REQUEST_TIMEOUT_SECONDS = 10
 SAMPLES_PER_FULL_DAY = 8  # 24 h of 3-hour forecast steps
+DEFAULT_UNITS = "imperial"  # US units (°F, mph) unless metric is requested
 
 _UNIT_LABELS = {
     "metric": {"temperature": "°C", "wind_speed": "m/s"},
@@ -26,12 +27,15 @@ class CurrentWeatherInput(BaseModel):
     """Arguments for the current weather tool."""
 
     city: str = Field(
-        description="City name, optionally with state/country code, e.g. 'Amarillo' or 'Paris,FR'.",
+        description=(
+            "City name, optionally with country code, e.g. 'Amarillo' or 'Paris,FR'. For a US state "
+            "use 'City,ST,US' (e.g. 'Amarillo,TX,US') or the full state name ('Amarillo, Texas')."
+        ),
         min_length=1,
     )
     units: Literal["metric", "imperial"] = Field(
-        default="metric",
-        description="'metric' for °C and m/s, 'imperial' for °F and mph.",
+        default=DEFAULT_UNITS,
+        description="'imperial' for °F and mph (default), 'metric' for °C and m/s.",
     )
 
 
@@ -95,7 +99,7 @@ def _format_location(name: str, country: str | None) -> str:
     return f"{name}, {country}" if country else name
 
 
-def fetch_current_weather(city: str, units: str = "metric") -> dict[str, Any]:
+def fetch_current_weather(city: str, units: str = DEFAULT_UNITS) -> dict[str, Any]:
     """Call OpenWeather's current weather endpoint and return a compact summary.
 
     Always returns a dict. On success ``ok`` is True; on failure ``ok`` is False
@@ -110,6 +114,8 @@ def fetch_current_weather(city: str, units: str = "metric") -> dict[str, Any]:
         weather = data.get("weather") or [{}]
         location = data["name"]
         country = data.get("sys", {}).get("country")
+        offset = data.get("timezone")
+        observed = data.get("dt")
         summary = {
             "ok": True,
             "location": _format_location(location, country),
@@ -118,10 +124,17 @@ def fetch_current_weather(city: str, units: str = "metric") -> dict[str, Any]:
             "feels_like": main["feels_like"],
             "humidity_percent": main["humidity"],
             "wind_speed": data.get("wind", {}).get("speed"),
+            "pressure_hpa": main.get("pressure"),
             "description": weather[0].get("description", "unknown"),
-            "unit_labels": _UNIT_LABELS[units],
+            "icon": weather[0].get("icon"),
+            # Local time of the provider's observation, when both the timestamp and offset are given.
+            "observed_local": (
+                _local_iso(int(observed), int(offset)) if observed is not None and offset is not None else None
+            ),
+            "utc_offset": _format_utc_offset(int(offset)) if offset is not None else None,
+            "unit_labels": _UNIT_LABELS[units] | {"pressure": "hPa"},
         }
-    except (ValueError, KeyError, TypeError, IndexError, AttributeError):
+    except (ValueError, KeyError, TypeError, IndexError, AttributeError, OverflowError, OSError):
         return _error(_UNEXPECTED_RESPONSE)
 
     return summary
@@ -133,13 +146,31 @@ def _format_utc_offset(seconds: int) -> str:
     return f"{sign}{minutes // 60:02d}:{minutes % 60:02d}"
 
 
+def _local_iso(timestamp: int, offset_seconds: int) -> str:
+    """Unix timestamp -> local wall-clock time, e.g. '2026-11-24T13:05'."""
+    return datetime.fromtimestamp(timestamp, timezone(timedelta(seconds=offset_seconds))).strftime("%Y-%m-%dT%H:%M")
+
+
+def _number(value: Any) -> float | None:
+    """A finite number from the provider, or ``None`` if it is missing or malformed."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 def _summarize_forecast_days(samples: list[dict[str, Any]], offset_seconds: int) -> list[dict[str, Any]]:
     """Group 3-hour forecast samples by local calendar date.
 
     High/low are the max/min of the sampled ``main.temp`` values, so they reflect
     only the sample times, not a true daily extreme. ``conditions`` is the most
-    frequent description that day (ties go to the earliest one). A day with fewer
-    than 8 samples (24 h / 3 h) is marked ``partial``.
+    frequent description that day (ties go to the earliest one), and ``icon`` is the
+    provider icon of that description's first sample. A day with fewer than 8 samples
+    (24 h / 3 h) is marked ``partial``.
+
+    ``precip_chance_percent`` is the highest ``pop`` (probability of precipitation) among
+    the day's samples, ``avg_humidity_percent`` the mean sample humidity, and
+    ``max_wind_speed`` the highest sample wind speed. Each is ``None`` when no sample
+    that day provides the value.
     """
     tz = timezone(timedelta(seconds=offset_seconds))
     days: dict[str, dict[str, Any]] = {}
@@ -149,10 +180,21 @@ def _summarize_forecast_days(samples: list[dict[str, Any]], offset_seconds: int)
         weather = sample.get("weather") or [{}]
         description = weather[0].get("description") or "unknown"
 
-        day = days.setdefault(local.date().isoformat(), {"temps": [], "descriptions": [], "times": []})
+        day = days.setdefault(
+            local.date().isoformat(),
+            {"temps": [], "descriptions": [], "times": [], "icons": {}, "pops": [], "humidity": [], "wind": []},
+        )
         day["temps"].append(temp)
         day["descriptions"].append(description)
         day["times"].append(local.strftime("%H:%M"))
+        if weather[0].get("icon"):
+            day["icons"].setdefault(description, weather[0]["icon"])
+        if (pop := _number(sample.get("pop"))) is not None:
+            day["pops"].append(pop)
+        if (humidity := _number(sample["main"].get("humidity"))) is not None:
+            day["humidity"].append(humidity)
+        if (wind := _number((sample.get("wind") or {}).get("speed"))) is not None:
+            day["wind"].append(wind)
 
     summaries = []
     for date, day in days.items():
@@ -166,6 +208,10 @@ def _summarize_forecast_days(samples: list[dict[str, Any]], offset_seconds: int)
                 "low": min(day["temps"]),
                 "conditions": dominant,
                 "other_conditions": [d for d in counts if d != dominant],
+                "icon": day["icons"].get(dominant),
+                "precip_chance_percent": round(max(day["pops"]) * 100) if day["pops"] else None,
+                "avg_humidity_percent": round(sum(day["humidity"]) / len(day["humidity"])) if day["humidity"] else None,
+                "max_wind_speed": max(day["wind"]) if day["wind"] else None,
                 "partial": len(day["temps"]) < SAMPLES_PER_FULL_DAY,
                 "sample_count": len(day["temps"]),
                 "first_sample_local": day["times"][0],
@@ -175,7 +221,7 @@ def _summarize_forecast_days(samples: list[dict[str, Any]], offset_seconds: int)
     return summaries
 
 
-def fetch_weather_forecast(city: str, units: str = "metric") -> dict[str, Any]:
+def fetch_weather_forecast(city: str, units: str = DEFAULT_UNITS) -> dict[str, Any]:
     """Call OpenWeather's 5-day / 3-hour forecast endpoint and summarize it per local day.
 
     Always returns a dict. On success ``ok`` is True and ``days`` lists one entry per
@@ -199,10 +245,11 @@ def fetch_weather_forecast(city: str, units: str = "metric") -> dict[str, Any]:
             "units": units,
             "utc_offset": _format_utc_offset(offset),
             "days": days,
-            "unit_labels": {"temperature": _UNIT_LABELS[units]["temperature"]},
+            "unit_labels": _UNIT_LABELS[units],
             "note": (
                 "High/low are the max/min of 3-hourly forecast samples, not true daily extremes. "
-                "Days marked partial have fewer than 8 samples."
+                "precip_chance_percent is the highest probability of precipitation among the day's "
+                "3-hour samples. Days marked partial have fewer than 8 samples."
             ),
         }
     except (ValueError, KeyError, TypeError, IndexError, AttributeError, OverflowError, OSError):
@@ -212,15 +259,17 @@ def fetch_weather_forecast(city: str, units: str = "metric") -> dict[str, Any]:
 
 
 @tool("get_current_weather", args_schema=CurrentWeatherInput)
-def get_current_weather(city: str, units: Literal["metric", "imperial"] = "metric") -> dict[str, Any]:
+def get_current_weather(city: str, units: Literal["metric", "imperial"] = DEFAULT_UNITS) -> dict[str, Any]:
     """Get the current weather for a city: resolved location, temperature, feels-like
-    temperature, humidity, wind speed, and a short conditions description."""
+    temperature, humidity, wind speed, pressure, a short conditions description, and the
+    local observation time."""
     return fetch_current_weather(city, units)
 
 
 @tool("get_weather_forecast", args_schema=ForecastInput)
-def get_weather_forecast(city: str, units: Literal["metric", "imperial"] = "metric") -> dict[str, Any]:
+def get_weather_forecast(city: str, units: Literal["metric", "imperial"] = DEFAULT_UNITS) -> dict[str, Any]:
     """Get the 5-day weather forecast for a city, summarized per local date: resolved
-    location, and for each day the high, low, and dominant weather conditions. Days
-    at the start or end of the forecast window may be partial (marked ``partial``)."""
+    location, and for each day the high, low, dominant weather conditions, precipitation
+    chance, average humidity, and maximum wind speed. Days at the start or end of the
+    forecast window may be partial (marked ``partial``)."""
     return fetch_weather_forecast(city, units)
